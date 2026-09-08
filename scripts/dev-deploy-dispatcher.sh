@@ -11,11 +11,13 @@ fi
 # ── Configuration ────────────────────────────────────────────────────────────
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-batch-gateway-dev}"
 DISPATCHER_RELEASE="${DISPATCHER_RELEASE:-dispatcher}"
-DISPATCHER_VERSION="${DISPATCHER_VERSION:-v0.7.4}"
-DISPATCHER_IMAGE="${DISPATCHER_IMAGE:-ghcr.io/llm-d/llm-d-async:${DISPATCHER_VERSION}}"
+DISPATCHER_VERSION="${DISPATCHER_VERSION:-c2c6293}"
+DISPATCHER_IMAGE="${DISPATCHER_IMAGE:-ghcr.io/llm-d/llm-d-async:${DISPATCHER_VERSION}@sha256:75fbc15a54013c79d1468b50af8258fc39afbf4a5c02cd78ad7a710aeaf84399}"
 DISPATCHER_CHART="${DISPATCHER_CHART:-oci://ghcr.io/llm-d/charts/async-processor}"
 DISPATCHER_CHART_VERSION="${DISPATCHER_CHART_VERSION:-0.7.4}"
 DISPATCHER_REDIS_PORT="${DISPATCHER_REDIS_PORT:-6399}"
+DISPATCHER_REDIS_NODE_PORT="${DISPATCHER_REDIS_NODE_PORT:-${REDIS_NODE_PORT:-30479}}"
+DISPATCHER_TRANSPORT_CONFIG="${DISPATCHER_TRANSPORT_CONFIG:-${REPO_ROOT}/test/e2e/dispatcher/transport-config.json}"
 PID_FILE="${REPO_ROOT}/.dispatcher-port-forward.pid"
 # Set DISPATCHER_SOURCE to a local llm-d-async checkout to build from source
 # instead of pulling a released image. The local chart is used automatically.
@@ -54,23 +56,19 @@ if [[ -n "${DISPATCHER_SOURCE}" ]]; then
     step "Building async-processor image from ${DISPATCHER_SOURCE}..."
     ${CONTAINER_TOOL} build -t "${DISPATCHER_IMAGE}" "${DISPATCHER_SOURCE}"
 else
-    if ${CONTAINER_TOOL} image exists "${DISPATCHER_IMAGE}" 2>/dev/null || \
-       ${CONTAINER_TOOL} inspect "${DISPATCHER_IMAGE}" &>/dev/null; then
-        step "Using local dispatcher image ${DISPATCHER_IMAGE}"
-    else
-        step "Pulling dispatcher image ${DISPATCHER_IMAGE}..."
-        ${CONTAINER_TOOL} pull "${DISPATCHER_IMAGE}"
-    fi
+    step "Using registry dispatcher image ${DISPATCHER_IMAGE}"
 fi
 
-step "Loading dispatcher image into Kind cluster '${KIND_CLUSTER_NAME}'..."
-if docker exec "${KIND_CLUSTER_NAME}-control-plane" ctr --namespace=k8s.io images list -q 2>/dev/null | grep -q "^${DISPATCHER_IMAGE}$"; then
-    log "Image already present in Kind node, skipping load"
-elif [[ "${CONTAINER_TOOL}" == "docker" ]]; then
-    docker save "${DISPATCHER_IMAGE}" | docker exec -i "${KIND_CLUSTER_NAME}-control-plane" \
-        ctr --namespace=k8s.io images import --snapshotter=overlayfs -
-else
-    ${CONTAINER_TOOL} save "${DISPATCHER_IMAGE}" | kind load image-archive /dev/stdin --name "${KIND_CLUSTER_NAME}"
+if [[ -n "${DISPATCHER_SOURCE}" ]]; then
+    step "Loading dispatcher image into Kind cluster '${KIND_CLUSTER_NAME}'..."
+    if docker exec "${KIND_CLUSTER_NAME}-control-plane" ctr --namespace=k8s.io images list -q 2>/dev/null | grep -q "^${DISPATCHER_IMAGE}$"; then
+        log "Image already present in Kind node, skipping load"
+    elif [[ "${CONTAINER_TOOL}" == "docker" ]]; then
+        docker save "${DISPATCHER_IMAGE}" | docker exec -i "${KIND_CLUSTER_NAME}-control-plane" \
+            ctr --namespace=k8s.io images import --snapshotter=overlayfs -
+    else
+        ${CONTAINER_TOOL} save "${DISPATCHER_IMAGE}" | kind load image-archive /dev/stdin --name "${KIND_CLUSTER_NAME}"
+    fi
 fi
 
 # ── Deploy async-processor via Helm ──────────────────────────────────────────
@@ -82,31 +80,89 @@ fi
 
 DISPATCHER_SCRAPE_RELEASE="${DISPATCHER_SCRAPE_RELEASE:-dispatcher-scrape}"
 HELM_VALUES_SCRAPE="${REPO_ROOT}/test/e2e/dispatcher/helm-values-scrape.yaml"
-IMAGE_REPO="$(echo "${DISPATCHER_IMAGE}" | cut -d: -f1)"
-IMAGE_TAG="$(echo "${DISPATCHER_IMAGE}" | cut -d: -f2)"
+
+# The chart renders repository:tag, so split on the tag separator in the final
+# path segment and retain any @sha256:digest suffix as part of the tag value.
+# This also handles registries with an explicit port.
+IMAGE_WITHOUT_DIGEST="${DISPATCHER_IMAGE%%@*}"
+if [[ "${IMAGE_WITHOUT_DIGEST##*/}" != *:* ]]; then
+    die "DISPATCHER_IMAGE must include a tag so chart ${DISPATCHER_CHART_VERSION} can render it: ${DISPATCHER_IMAGE}"
+fi
+IMAGE_REPO="${IMAGE_WITHOUT_DIGEST%:*}"
+IMAGE_TAG="${IMAGE_WITHOUT_DIGEST##*:}"
+DISPATCHER_EXPECTED_DIGEST=""
+if [[ "${DISPATCHER_IMAGE}" == *@* ]]; then
+    DISPATCHER_EXPECTED_DIGEST="${DISPATCHER_IMAGE#*@}"
+    IMAGE_TAG="${IMAGE_TAG}@${DISPATCHER_EXPECTED_DIGEST}"
+fi
+
+if [[ ! -f "${DISPATCHER_TRANSPORT_CONFIG}" ]]; then
+    die "Dispatcher transport config not found: ${DISPATCHER_TRANSPORT_CONFIG}"
+fi
+TRANSPORT_CONFIG_JSON="$(jq -c . "${DISPATCHER_TRANSPORT_CONFIG}")"
 
 HELM_VERSION_FLAG=()
 if [[ -n "${DISPATCHER_CHART_VERSION:-}" ]]; then
     HELM_VERSION_FLAG=(--version "${DISPATCHER_CHART_VERSION}")
 fi
+HELM_CONFLICT_FLAG=()
+if helm upgrade --help | grep -q -- '--force-conflicts'; then
+    # Helm 4 server-side apply must reclaim fields changed by the test-only
+    # compatibility patch before that patch is reapplied below.
+    HELM_CONFLICT_FLAG=(--force-conflicts)
+fi
+
+DISPATCHER_IMAGE_PULL_POLICY="Never"
+if [[ -z "${DISPATCHER_SOURCE}" ]]; then
+    # A tag@digest reference cannot be round-tripped through docker save with
+    # the same CRI name. Let kubelet pull the immutable registry reference.
+    DISPATCHER_IMAGE_PULL_POLICY="IfNotPresent"
+fi
 
 step "Deploying async-processor with redis gate (release: ${DISPATCHER_RELEASE})..."
 helm upgrade --install "${DISPATCHER_RELEASE}" "${DISPATCHER_CHART}" \
     "${HELM_VERSION_FLAG[@]}" \
+    "${HELM_CONFLICT_FLAG[@]}" \
     --namespace "${NAMESPACE}" \
     --values "${HELM_VALUES}" \
-    --set "ap.image.repository=${IMAGE_REPO}" \
-    --set "ap.image.tag=${IMAGE_TAG}" \
-    --wait --timeout=120s
+    --set-string "ap.image.repository=${IMAGE_REPO}" \
+    --set-string "ap.image.tag=${IMAGE_TAG}" \
+    --set-string "ap.imagePullPolicy=${DISPATCHER_IMAGE_PULL_POLICY}" \
+    --timeout=120s
+
+# Chart 0.7.4 only renders deprecated per-backend flags and has no value for
+# claim lease/reclaim tuning. Append Async's canonical transport flags to this
+# test deployment; the current image then ignores the chart's legacy Redis
+# flags. Keep this patch test-only until a released chart exposes transport
+# config directly.
+TRANSPORT_ARGS_PATCH="$(jq -cn --arg config "${TRANSPORT_CONFIG_JSON}" '[
+  {"op":"replace","path":"/spec/template/spec/containers/0/command","value":["/llm-d-async"]},
+  {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--transport=redis-sortedset"},
+  {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":("--transport-config=" + $config)}
+]')"
+kubectl patch deployment/"${DISPATCHER_RELEASE}-async-processor" \
+    --namespace "${NAMESPACE}" \
+    --field-manager=helm \
+    --type=json \
+    --patch "${TRANSPORT_ARGS_PATCH}"
+
+DISPATCHER_COMMAND_PATCH='[{"op":"replace","path":"/spec/template/spec/containers/0/command","value":["/llm-d-async"]}]'
 
 step "Deploying async-processor with endpoint-scrape gate (release: ${DISPATCHER_SCRAPE_RELEASE})..."
 helm upgrade --install "${DISPATCHER_SCRAPE_RELEASE}" "${DISPATCHER_CHART}" \
     "${HELM_VERSION_FLAG[@]}" \
+    "${HELM_CONFLICT_FLAG[@]}" \
     --namespace "${NAMESPACE}" \
     --values "${HELM_VALUES_SCRAPE}" \
-    --set "ap.image.repository=${IMAGE_REPO}" \
-    --set "ap.image.tag=${IMAGE_TAG}" \
-    --wait --timeout=120s
+    --set-string "ap.image.repository=${IMAGE_REPO}" \
+    --set-string "ap.image.tag=${IMAGE_TAG}" \
+    --set-string "ap.imagePullPolicy=${DISPATCHER_IMAGE_PULL_POLICY}" \
+    --timeout=120s
+kubectl patch deployment/"${DISPATCHER_SCRAPE_RELEASE}-async-processor" \
+    --namespace "${NAMESPACE}" \
+    --field-manager=helm \
+    --type=json \
+    --patch "${DISPATCHER_COMMAND_PATCH}"
 
 DISPATCHER_PROM_RELEASE="${DISPATCHER_PROM_RELEASE:-dispatcher-prom}"
 HELM_VALUES_PROM="${REPO_ROOT}/test/e2e/dispatcher/helm-values-prometheus.yaml"
@@ -114,11 +170,18 @@ HELM_VALUES_PROM="${REPO_ROOT}/test/e2e/dispatcher/helm-values-prometheus.yaml"
 step "Deploying async-processor with prometheus-query gate (release: ${DISPATCHER_PROM_RELEASE})..."
 helm upgrade --install "${DISPATCHER_PROM_RELEASE}" "${DISPATCHER_CHART}" \
     "${HELM_VERSION_FLAG[@]}" \
+    "${HELM_CONFLICT_FLAG[@]}" \
     --namespace "${NAMESPACE}" \
     --values "${HELM_VALUES_PROM}" \
-    --set "ap.image.repository=${IMAGE_REPO}" \
-    --set "ap.image.tag=${IMAGE_TAG}" \
-    --wait --timeout=120s
+    --set-string "ap.image.repository=${IMAGE_REPO}" \
+    --set-string "ap.image.tag=${IMAGE_TAG}" \
+    --set-string "ap.imagePullPolicy=${DISPATCHER_IMAGE_PULL_POLICY}" \
+    --timeout=120s
+kubectl patch deployment/"${DISPATCHER_PROM_RELEASE}-async-processor" \
+    --namespace "${NAMESPACE}" \
+    --field-manager=helm \
+    --type=json \
+    --patch "${DISPATCHER_COMMAND_PATCH}"
 
 log "Dispatchers deployed."
 
@@ -130,6 +193,36 @@ kubectl wait --for=condition=available deployment/"${DISPATCHER_SCRAPE_RELEASE}-
     --namespace "${NAMESPACE}" --timeout=60s
 kubectl wait --for=condition=available deployment/"${DISPATCHER_PROM_RELEASE}-async-processor" \
     --namespace "${NAMESPACE}" --timeout=60s
+
+verify_dispatcher_runtime_image() {
+    local release="$1"
+    local pod
+    local actual_image
+    local image_id
+
+    pod="$(kubectl get pods \
+        --namespace "${NAMESPACE}" \
+        --selector "app.kubernetes.io/instance=${release},app.kubernetes.io/name=async-processor" \
+        --field-selector status.phase=Running \
+        -o json | jq -r '.items[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name' | head -n1)"
+    if [[ -z "${pod}" ]]; then
+        die "No ready Async pod found for release ${release}"
+    fi
+
+    actual_image="$(kubectl get pod "${pod}" --namespace "${NAMESPACE}" -o jsonpath='{.spec.containers[?(@.name=="async-processor")].image}')"
+    image_id="$(kubectl get pod "${pod}" --namespace "${NAMESPACE}" -o jsonpath='{.status.containerStatuses[?(@.name=="async-processor")].imageID}')"
+    if [[ "${actual_image}" != "${DISPATCHER_IMAGE}" ]]; then
+        die "Async pod ${pod} image is ${actual_image}, expected ${DISPATCHER_IMAGE}"
+    fi
+    if [[ -n "${DISPATCHER_EXPECTED_DIGEST}" && "${image_id##*@}" != "${DISPATCHER_EXPECTED_DIGEST}" ]]; then
+        die "Async pod ${pod} runtime imageID is ${image_id}, expected digest ${DISPATCHER_EXPECTED_DIGEST}"
+    fi
+    log "Verified ${pod} uses ${actual_image} (runtime imageID: ${image_id})"
+}
+
+verify_dispatcher_runtime_image "${DISPATCHER_RELEASE}"
+verify_dispatcher_runtime_image "${DISPATCHER_SCRAPE_RELEASE}"
+verify_dispatcher_runtime_image "${DISPATCHER_PROM_RELEASE}"
 
 # ── Add vllm-sim to Prometheus scrape targets ────────────────────────────────
 step "Adding vllm-sim to Prometheus scrape config..."
@@ -189,12 +282,13 @@ kubectl rollout status deployment/"${HELM_RELEASE}-processor" --namespace "${NAM
 
 log "Processor reconfigured for async dispatch."
 
-# ── Port-forward Redis to host ───────────────────────────────────────────────
-# Kind only exposes ports declared in extraPortMappings at cluster creation.
-# Use kubectl port-forward to make Redis accessible from the host.
-step "Setting up Redis port-forward on localhost:${DISPATCHER_REDIS_PORT}..."
+# ── Expose Redis to host ──────────────────────────────────────────────────────
+# dev-deploy.sh reserves this NodePort in Kind's extraPortMappings. Create the
+# matching service instead of competing with Docker's host listener by trying
+# to bind kubectl port-forward to the same port.
+step "Exposing Redis on localhost:${DISPATCHER_REDIS_PORT}..."
 
-# Kill any previous port-forward
+# Clean up a port-forward left by an older version of this harness.
 if [[ -f "${PID_FILE}" ]]; then
     old_pid=$(cat "${PID_FILE}")
     kill "${old_pid}" 2>/dev/null || true
@@ -207,12 +301,25 @@ if [[ "${EXCHANGE_CLIENT_TYPE}" == "valkey" ]]; then
     redis_svc="${REDIS_RELEASE}-valkey-primary"
 fi
 
-kubectl port-forward "svc/${redis_svc}" "${DISPATCHER_REDIS_PORT}:6379" \
-    --namespace "${NAMESPACE}" &
-PORT_FORWARD_PID=$!
-echo "${PORT_FORWARD_PID}" > "${PID_FILE}"
+kubectl get service "${redis_svc}" --namespace "${NAMESPACE}" -o json | \
+    jq --arg name "${redis_svc}-nodeport" --argjson nodePort "${DISPATCHER_REDIS_NODE_PORT}" '{
+        apiVersion: "v1",
+        kind: "Service",
+        metadata: {name: $name, namespace: .metadata.namespace},
+        spec: {
+            type: "NodePort",
+            selector: .spec.selector,
+            ports: [(.spec.ports[0] | {
+                name: .name,
+                protocol: .protocol,
+                port: .port,
+                targetPort: .targetPort,
+                nodePort: $nodePort
+            })]
+        }
+    }' | kubectl apply -f -
 
-# Wait for the port-forward to be ready
+# Wait for Kind's host mapping to reach the NodePort service.
 for i in $(seq 1 10); do
     if nc -z localhost "${DISPATCHER_REDIS_PORT}" 2>/dev/null; then
         break
@@ -221,7 +328,7 @@ for i in $(seq 1 10); do
 done
 
 if ! nc -z localhost "${DISPATCHER_REDIS_PORT}" 2>/dev/null; then
-    die "Port-forward to Redis failed to start"
+    die "Redis NodePort failed to become reachable"
 fi
 
 log "Redis accessible at localhost:${DISPATCHER_REDIS_PORT}"

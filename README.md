@@ -239,6 +239,17 @@ make dev-deploy
 IMAGE_TAG=v0.1.0 SKIP_BUILD=true make dev-deploy
 ```
 
+To exercise the composed Async dispatch path, deploy with `ENABLE_DISPATCHER=true` and run the dispatcher E2E suite:
+
+```bash
+ENABLE_DISPATCHER=true make dev-deploy
+ENABLE_DISPATCHER=true make test-e2e TEST_RUN=TestDispatcher
+```
+
+The dispatcher harness pins `ghcr.io/llm-d/llm-d-async:c2c6293@sha256:75fbc15a54013c79d1468b50af8258fc39afbf4a5c02cd78ad7a710aeaf84399` and verifies the running pod for each dispatcher deployment has the expected image reference and runtime `imageID`. `TestDispatcher/BatchAPIHardKillRecovery` covers the composed Kubernetes path from the Files and Batch APIs through the Batch Processor, Async, inference, the Processor's replica-specific result queue, and durable output/error files. This complements llm-d-async PR #412's in-process/miniredis component coverage by force-deleting the sole Async pod only after every request is durably claimed, then verifying lease takeover, terminal counts, files, and externally visible deduplication.
+
+Async chart 0.7.4 cannot express the canonical claim lease/reclaim fields and still names the previous `/async-processor` entrypoint, so the development harness patches `/llm-d-async`, `--transport=redis-sortedset`, and an inline `--transport-config` after Helm creates the test deployments. Registry images use `IfNotPresent` so Kubernetes can resolve the exact `tag@digest` reference; local source builds remain preloaded with `Never`. Remove these test-only compatibility patches once a released Async chart supports the current entrypoint and canonical transport configuration. Production durability requires persistent Redis (AOF and/or replication) and a fully rolled out Async fleet that supports claim-based dequeue; an old replica can still destructively dequeue work during a mixed-version rolling upgrade.
+
 For detailed instructions, see [Development Guide](docs/guides/development.md).
 
 #### Production Deployment
