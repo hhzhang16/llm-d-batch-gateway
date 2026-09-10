@@ -29,8 +29,8 @@ import (
 )
 
 const (
-	durableAsyncImage  = "ghcr.io/llm-d/llm-d-async:c2c6293@sha256:75fbc15a54013c79d1468b50af8258fc39afbf4a5c02cd78ad7a710aeaf84399"
-	durableAsyncDigest = "sha256:75fbc15a54013c79d1468b50af8258fc39afbf4a5c02cd78ad7a710aeaf84399"
+	durableAsyncImage  = "ghcr.io/llm-d/llm-d-async:v0.9.1@sha256:d8db64675b6a5f70486d74de9f28aa2ee88e7e2c4e3ba97ba2078d634c2fd610"
+	durableAsyncDigest = "sha256:d8db64675b6a5f70486d74de9f28aa2ee88e7e2c4e3ba97ba2078d634c2fd610"
 )
 
 type asyncPod struct {
@@ -242,7 +242,7 @@ func listAsyncPods(t *testing.T) ([]asyncPod, error) {
 	release := getEnvOrDefault("TEST_DISPATCHER_RELEASE", "dispatcher")
 	out, err := exec.Command("kubectl", "get", "pods",
 		"--namespace", testNamespace,
-		"--selector", fmt.Sprintf("app.kubernetes.io/instance=%s,app.kubernetes.io/name=async-processor", release),
+		"--selector", fmt.Sprintf("app.kubernetes.io/instance=%s,app.kubernetes.io/name=llm-d-async", release),
 		"-o", "json").CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("list Async pods: %w\n%s", err, out)
@@ -287,13 +287,13 @@ func listAsyncPods(t *testing.T) ([]asyncPod, error) {
 			}
 		}
 		for _, container := range item.Spec.Containers {
-			if container.Name == "async-processor" {
+			if container.Name == "llm-d-async" {
 				pod.Image = container.Image
 				break
 			}
 		}
 		for _, status := range item.Status.ContainerStatuses {
-			if status.Name == "async-processor" {
+			if status.Name == "llm-d-async" {
 				pod.ImageID = status.ImageID
 				break
 			}

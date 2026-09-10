@@ -11,13 +11,12 @@ fi
 # ── Configuration ────────────────────────────────────────────────────────────
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-batch-gateway-dev}"
 DISPATCHER_RELEASE="${DISPATCHER_RELEASE:-dispatcher}"
-DISPATCHER_VERSION="${DISPATCHER_VERSION:-c2c6293}"
-DISPATCHER_IMAGE="${DISPATCHER_IMAGE:-ghcr.io/llm-d/llm-d-async:${DISPATCHER_VERSION}@sha256:75fbc15a54013c79d1468b50af8258fc39afbf4a5c02cd78ad7a710aeaf84399}"
-DISPATCHER_CHART="${DISPATCHER_CHART:-oci://ghcr.io/llm-d/charts/async-processor}"
-DISPATCHER_CHART_VERSION="${DISPATCHER_CHART_VERSION:-0.7.4}"
+DISPATCHER_VERSION="${DISPATCHER_VERSION:-v0.9.1}"
+DISPATCHER_IMAGE="${DISPATCHER_IMAGE:-ghcr.io/llm-d/llm-d-async:${DISPATCHER_VERSION}@sha256:d8db64675b6a5f70486d74de9f28aa2ee88e7e2c4e3ba97ba2078d634c2fd610}"
+DISPATCHER_CHART="${DISPATCHER_CHART:-oci://ghcr.io/llm-d/charts/llm-d-async}"
+DISPATCHER_CHART_VERSION="${DISPATCHER_CHART_VERSION:-v0.9.1}"
 DISPATCHER_REDIS_PORT="${DISPATCHER_REDIS_PORT:-6399}"
 DISPATCHER_REDIS_NODE_PORT="${DISPATCHER_REDIS_NODE_PORT:-${REDIS_NODE_PORT:-30479}}"
-DISPATCHER_TRANSPORT_CONFIG="${DISPATCHER_TRANSPORT_CONFIG:-${REPO_ROOT}/test/e2e/dispatcher/transport-config.json}"
 PID_FILE="${REPO_ROOT}/.dispatcher-port-forward.pid"
 # Set DISPATCHER_SOURCE to a local llm-d-async checkout to build from source
 # instead of pulling a released image. The local chart is used automatically.
@@ -51,7 +50,7 @@ if [[ -n "${DISPATCHER_SOURCE}" ]]; then
         die "DISPATCHER_SOURCE directory not found: ${DISPATCHER_SOURCE}"
     fi
     DISPATCHER_IMAGE="ghcr.io/llm-d/llm-d-async:dev-local"
-    DISPATCHER_CHART="${DISPATCHER_SOURCE}/charts/async-processor"
+    DISPATCHER_CHART="${DISPATCHER_SOURCE}/charts/llm-d-async"
     unset DISPATCHER_CHART_VERSION
     step "Building async-processor image from ${DISPATCHER_SOURCE}..."
     ${CONTAINER_TOOL} build -t "${DISPATCHER_IMAGE}" "${DISPATCHER_SOURCE}"
@@ -96,20 +95,9 @@ if [[ "${DISPATCHER_IMAGE}" == *@* ]]; then
     IMAGE_TAG="${IMAGE_TAG}@${DISPATCHER_EXPECTED_DIGEST}"
 fi
 
-if [[ ! -f "${DISPATCHER_TRANSPORT_CONFIG}" ]]; then
-    die "Dispatcher transport config not found: ${DISPATCHER_TRANSPORT_CONFIG}"
-fi
-TRANSPORT_CONFIG_JSON="$(jq -c . "${DISPATCHER_TRANSPORT_CONFIG}")"
-
 HELM_VERSION_FLAG=()
 if [[ -n "${DISPATCHER_CHART_VERSION:-}" ]]; then
     HELM_VERSION_FLAG=(--version "${DISPATCHER_CHART_VERSION}")
-fi
-HELM_CONFLICT_FLAG=()
-if helm upgrade --help | grep -q -- '--force-conflicts'; then
-    # Helm 4 server-side apply must reclaim fields changed by the test-only
-    # compatibility patch before that patch is reapplied below.
-    HELM_CONFLICT_FLAG=(--force-conflicts)
 fi
 
 DISPATCHER_IMAGE_PULL_POLICY="Never"
@@ -122,7 +110,6 @@ fi
 step "Deploying async-processor with redis gate (release: ${DISPATCHER_RELEASE})..."
 helm upgrade --install "${DISPATCHER_RELEASE}" "${DISPATCHER_CHART}" \
     "${HELM_VERSION_FLAG[@]}" \
-    "${HELM_CONFLICT_FLAG[@]}" \
     --namespace "${NAMESPACE}" \
     --values "${HELM_VALUES}" \
     --set-string "ap.image.repository=${IMAGE_REPO}" \
@@ -130,39 +117,15 @@ helm upgrade --install "${DISPATCHER_RELEASE}" "${DISPATCHER_CHART}" \
     --set-string "ap.imagePullPolicy=${DISPATCHER_IMAGE_PULL_POLICY}" \
     --timeout=120s
 
-# Chart 0.7.4 only renders deprecated per-backend flags and has no value for
-# claim lease/reclaim tuning. Append Async's canonical transport flags to this
-# test deployment; the current image then ignores the chart's legacy Redis
-# flags. Keep this patch test-only until a released chart exposes transport
-# config directly.
-TRANSPORT_ARGS_PATCH="$(jq -cn --arg config "${TRANSPORT_CONFIG_JSON}" '[
-  {"op":"replace","path":"/spec/template/spec/containers/0/command","value":["/llm-d-async"]},
-  {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--transport=redis-sortedset"},
-  {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":("--transport-config=" + $config)}
-]')"
-kubectl patch deployment/"${DISPATCHER_RELEASE}-async-processor" \
-    --namespace "${NAMESPACE}" \
-    --field-manager=helm \
-    --type=json \
-    --patch "${TRANSPORT_ARGS_PATCH}"
-
-DISPATCHER_COMMAND_PATCH='[{"op":"replace","path":"/spec/template/spec/containers/0/command","value":["/llm-d-async"]}]'
-
 step "Deploying async-processor with endpoint-scrape gate (release: ${DISPATCHER_SCRAPE_RELEASE})..."
 helm upgrade --install "${DISPATCHER_SCRAPE_RELEASE}" "${DISPATCHER_CHART}" \
     "${HELM_VERSION_FLAG[@]}" \
-    "${HELM_CONFLICT_FLAG[@]}" \
     --namespace "${NAMESPACE}" \
     --values "${HELM_VALUES_SCRAPE}" \
     --set-string "ap.image.repository=${IMAGE_REPO}" \
     --set-string "ap.image.tag=${IMAGE_TAG}" \
     --set-string "ap.imagePullPolicy=${DISPATCHER_IMAGE_PULL_POLICY}" \
     --timeout=120s
-kubectl patch deployment/"${DISPATCHER_SCRAPE_RELEASE}-async-processor" \
-    --namespace "${NAMESPACE}" \
-    --field-manager=helm \
-    --type=json \
-    --patch "${DISPATCHER_COMMAND_PATCH}"
 
 DISPATCHER_PROM_RELEASE="${DISPATCHER_PROM_RELEASE:-dispatcher-prom}"
 HELM_VALUES_PROM="${REPO_ROOT}/test/e2e/dispatcher/helm-values-prometheus.yaml"
@@ -170,28 +133,22 @@ HELM_VALUES_PROM="${REPO_ROOT}/test/e2e/dispatcher/helm-values-prometheus.yaml"
 step "Deploying async-processor with prometheus-query gate (release: ${DISPATCHER_PROM_RELEASE})..."
 helm upgrade --install "${DISPATCHER_PROM_RELEASE}" "${DISPATCHER_CHART}" \
     "${HELM_VERSION_FLAG[@]}" \
-    "${HELM_CONFLICT_FLAG[@]}" \
     --namespace "${NAMESPACE}" \
     --values "${HELM_VALUES_PROM}" \
     --set-string "ap.image.repository=${IMAGE_REPO}" \
     --set-string "ap.image.tag=${IMAGE_TAG}" \
     --set-string "ap.imagePullPolicy=${DISPATCHER_IMAGE_PULL_POLICY}" \
     --timeout=120s
-kubectl patch deployment/"${DISPATCHER_PROM_RELEASE}-async-processor" \
-    --namespace "${NAMESPACE}" \
-    --field-manager=helm \
-    --type=json \
-    --patch "${DISPATCHER_COMMAND_PATCH}"
 
 log "Dispatchers deployed."
 
 # ── Verify dispatchers ───────────────────────────────────────────────────────
 step "Waiting for dispatcher pods to be ready..."
-kubectl wait --for=condition=available deployment/"${DISPATCHER_RELEASE}-async-processor" \
+kubectl wait --for=condition=available deployment/"${DISPATCHER_RELEASE}-llm-d-async" \
     --namespace "${NAMESPACE}" --timeout=60s
-kubectl wait --for=condition=available deployment/"${DISPATCHER_SCRAPE_RELEASE}-async-processor" \
+kubectl wait --for=condition=available deployment/"${DISPATCHER_SCRAPE_RELEASE}-llm-d-async" \
     --namespace "${NAMESPACE}" --timeout=60s
-kubectl wait --for=condition=available deployment/"${DISPATCHER_PROM_RELEASE}-async-processor" \
+kubectl wait --for=condition=available deployment/"${DISPATCHER_PROM_RELEASE}-llm-d-async" \
     --namespace "${NAMESPACE}" --timeout=60s
 
 verify_dispatcher_runtime_image() {
@@ -202,15 +159,15 @@ verify_dispatcher_runtime_image() {
 
     pod="$(kubectl get pods \
         --namespace "${NAMESPACE}" \
-        --selector "app.kubernetes.io/instance=${release},app.kubernetes.io/name=async-processor" \
+        --selector "app.kubernetes.io/instance=${release},app.kubernetes.io/name=llm-d-async" \
         --field-selector status.phase=Running \
         -o json | jq -r '.items[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name' | head -n1)"
     if [[ -z "${pod}" ]]; then
         die "No ready Async pod found for release ${release}"
     fi
 
-    actual_image="$(kubectl get pod "${pod}" --namespace "${NAMESPACE}" -o jsonpath='{.spec.containers[?(@.name=="async-processor")].image}')"
-    image_id="$(kubectl get pod "${pod}" --namespace "${NAMESPACE}" -o jsonpath='{.status.containerStatuses[?(@.name=="async-processor")].imageID}')"
+    actual_image="$(kubectl get pod "${pod}" --namespace "${NAMESPACE}" -o jsonpath='{.spec.containers[?(@.name=="llm-d-async")].image}')"
+    image_id="$(kubectl get pod "${pod}" --namespace "${NAMESPACE}" -o jsonpath='{.status.containerStatuses[?(@.name=="llm-d-async")].imageID}')"
     if [[ "${actual_image}" != "${DISPATCHER_IMAGE}" ]]; then
         die "Async pod ${pod} image is ${actual_image}, expected ${DISPATCHER_IMAGE}"
     fi
@@ -370,7 +327,7 @@ log "Usage:"
 log "  ENABLE_DISPATCHER=true make test-e2e"
 log "  ENABLE_DISPATCHER=true TEST_REDIS_URL=redis://localhost:${DISPATCHER_REDIS_PORT} go test ./test/e2e/ -run TestDispatcher -v -count=1"
 log ""
-log "Jaeger UI: http://localhost:${JAEGER_PORT}  (traces from both batch-gateway and async-processor)"
+log "Jaeger UI: http://localhost:${JAEGER_PORT}  (traces from both batch-gateway and llm-d-async)"
 log "To stop port-forwards: make dev-clean"
 log ""
 if [[ -n "${DISPATCHER_SOURCE}" ]]; then
