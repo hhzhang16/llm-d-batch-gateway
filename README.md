@@ -239,8 +239,6 @@ make dev-deploy
 IMAGE_TAG=v0.1.0 SKIP_BUILD=true make dev-deploy
 ```
 
-For the composed Async dispatcher deployment and recovery tests, see the [E2E test guide](test/e2e/README.md#async-dispatcher-tests).
-
 For detailed instructions, see [Development Guide](docs/guides/development.md).
 
 #### Production Deployment
